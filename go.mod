@@ -1,4 +1,4 @@
-module github.com/lsclh/go-ws
+module github.com/lsclh/gws
 
 go 1.18
 

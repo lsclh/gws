@@ -2,51 +2,65 @@ package gws
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/gorilla/websocket"
 	"net"
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-// 配置文件
+const (
+	defaultReadLimit    int64 = 1 << 20
+	defaultWriteTimeout       = 10 * time.Second
+	sendQueueSize             = 100
+	maxCloseWait              = time.Second
+)
+
+const (
+	stateIdle = iota
+	stateDialing
+	stateRunning
+	stateDraining
+	stateClosed
+)
+
+// ErrNotConnected 表示连接尚未建立。
+var ErrNotConnected = errors.New("gws: 未连接")
+
+// ErrClosed 表示连接已关闭。
+var ErrClosed = errors.New("gws: 已关闭")
+
+// ErrAlreadyConnected 表示 Connect 被重复调用。
+var ErrAlreadyConnected = errors.New("gws: 重复连接")
+
+// Options 是客户端或服务端的连接配置，字段通过 Option 设置。
 type Options struct {
-
-	//作为客户端使用
-	wsHost *url.URL
-
-	//作为客户端连接使用
+	wsHost        *url.URL
 	requestHeader http.Header
+	httpWrite     http.ResponseWriter
+	httpRequest   *http.Request
+	checkOrigin   CheckOriginFunc
+	onOpen        onOpen
+	onClose       onClose
+	onError       onError
+	onMessage     onMessage
+	serviceType   service
 
-	//http写对象 作为服务端使用
-	httpWrite http.ResponseWriter
-
-	//http请求对象 作为服务端使用
-	httpRequest *http.Request
-
-	//验证连接权限
-	checkOrigin CheckOriginFunc
-
-	//连接成功回调
-	onOpen onOpen
-
-	//关闭回调
-	onClose onClose
-
-	//错误回调
-	onError onError
-
-	//接收到消息回调
-	onMessage onMessage
-
-	//连接类型
-	serviceType service
+	readLimit       int64
+	readLimitSet    bool
+	pingInterval    time.Duration
+	writeTimeout    time.Duration
+	writeTimeoutSet bool
 }
 
+// CheckOriginFunc 在服务端握手时校验请求。返回 false 会拒绝连接。
 type CheckOriginFunc func(r *http.Request, ctx *Context) bool
 
+// Option 修改连接配置。
 type Option func(e *Options)
 
 func WithServerHttp(w http.ResponseWriter, r *http.Request) Option {
@@ -57,6 +71,8 @@ func WithServerHttp(w http.ResponseWriter, r *http.Request) Option {
 	}
 }
 
+// WithServerAuth 设置握手校验。不设置时使用 gorilla 的同源策略：
+// 没有 Origin 头的非浏览器客户端可以连接，跨站浏览器请求会被拒绝。
 func WithServerAuth(fn CheckOriginFunc) Option {
 	return func(e *Options) {
 		e.checkOrigin = fn
@@ -71,434 +87,702 @@ func WithClientWsUrl(u *url.URL, requestHeader http.Header) Option {
 	}
 }
 
-/*************************************************WS链接可操作函数start***************************************************/
-
-// 获取ws对象
-func NewWebsocket(opts ...Option) (cl *client) {
-	cf := &Options{}
-	for _, fn := range opts {
-		fn(cf)
+// WithReadLimit 设置单条消息的最大字节数。0 表示不限制。
+func WithReadLimit(n int64) Option {
+	return func(e *Options) {
+		e.readLimit = n
+		e.readLimitSet = true
 	}
-	if cf.checkOrigin == nil {
-		cf.checkOrigin = func(r *http.Request, ctx *Context) bool {
-			return true
+}
+
+// WithPingInterval 打开心跳。d 是发送 Ping 的间隔，读超时为这个间隔的两倍。
+// 默认关闭。不调用，或传入 0，都不会发 Ping，也没有读超时。
+func WithPingInterval(d time.Duration) Option {
+	return func(e *Options) {
+		if d < 0 {
+			d = 0
 		}
+		e.pingInterval = d
 	}
-	cl = &client{
-		options: cf,
-		isClose: true,
-		ctx: Context{
-			Ctx: context.Background(),
-		},
+}
+
+// WithWriteTimeout 设置单次写入的超时时间。
+func WithWriteTimeout(d time.Duration) Option {
+	return func(e *Options) {
+		e.writeTimeout = d
+		e.writeTimeoutSet = true
 	}
-	return
 }
 
-// 开始连接
-func (c *client) Connect() error {
-	if c.options.serviceType == CLIENT {
-		conn, _, err := websocket.DefaultDialer.Dial(c.options.wsHost.String(), c.options.requestHeader)
-		if err != nil {
-			return err
-		}
-		c.ctx.conn = conn
-	} else {
-		conn, err := (&websocket.Upgrader{CheckOrigin: func(r *http.Request) bool {
-			return c.options.checkOrigin(r, &c.ctx)
-
-		}}).Upgrade(c.options.httpWrite, c.options.httpRequest, nil)
-		if err != nil {
-			http.NotFound(c.options.httpWrite, c.options.httpRequest)
-			return err
-		}
-		c.ctx.conn = conn
-	}
-	return c.init()
-}
-
-// 立即推送 -- 需要推送数量过多时 优先推送的数据
-func (c *client) ForthwithSend(payload []byte) error {
-	return c.ctx.ForthwithSend(payload)
-}
-
-// 稍后推送 -- 需要推送数量过多时 延后推送的数据
-func (c *client) LaterSend(payload []byte) error {
-	return c.ctx.LaterSend(payload)
-}
-
-// 断开连接
-func (c *client) Close() {
-	c.close()
-}
-
-/*************************************************WS链接可操作函数end***************************************************/
-
-/*************************************************WS链接回调函数start***************************************************/
-
-// 连接成功事件
-func (c *client) OnOpen(fn onOpen) {
-	c.options.onOpen = fn
-}
-
-// 断开连接
-func (c *client) OnClose(fn onClose) {
-	c.options.onClose = fn
-}
-
-// 连接期间发生错误
-func (c *client) OnError(fn onError) {
-	c.options.onError = fn
-}
-
-func (c *client) OnMessage(fn onMessage) {
-	c.options.onMessage = fn
-}
-
-/*************************************************WS链接回调函数end***************************************************/
-
-/*************************************************WS链接内部逻辑start***************************************************/
-
-// 代码依赖项
 type service int
 
 const (
-	CLIENT service = 1 << 0 //标记为客户端
-	SERVER service = 1 << 1 //标记为服务端
+	CLIENT service = 1 << 0
+	SERVER service = 1 << 1
 )
 
+// Context 是单条连接的回调上下文。
 type Context struct {
-	conn           *websocket.Conn
-	sendChan       chan []byte //主发送消息
-	secondSendChan chan []byte //次发送消息
-	Ctx            context.Context
-	Storage        storage
+	client      *Client
+	Ctx         context.Context
+	Storage     storage
+	MessageType int // 仅在 OnMessage 回调内有效，取值为 TextMessage 或 BinaryMessage
 }
 
-type storage struct {
-	mu   sync.RWMutex
-	Keys map[string]any
+// ForthwithSend 立即发送文本消息。
+func (ctx *Context) ForthwithSend(payload []byte) error {
+	return ctx.client.ForthwithSend(payload)
 }
 
-func (c *Context) ForthwithSend(payload []byte) (err error) {
-	defer func() {
-		if panicErr := recover(); panicErr != nil {
-			err = fmt.Errorf("写异常: %v", panicErr)
-		}
-	}()
-	c.sendChan <- payload
-	return
+// LaterSend 在当前已排队的立即消息之后发送文本消息。
+func (ctx *Context) LaterSend(payload []byte) error {
+	return ctx.client.LaterSend(payload)
 }
 
-// 稍后推送 -- 需要推送数量过多时 延后推送的数据
-func (c *Context) LaterSend(payload []byte) (err error) {
-	defer func() {
-		if panicErr := recover(); panicErr != nil {
-			err = fmt.Errorf("写异常: %v", panicErr)
-		}
-	}()
-	c.secondSendChan <- payload
-	return
+// ForthwithSendMessage 立即发送指定类型的数据帧。
+func (ctx *Context) ForthwithSendMessage(messageType int, payload []byte) error {
+	return ctx.client.ForthwithSendMessage(messageType, payload)
 }
 
-/************************************/
-/******** METADATA MANAGEMENT********/
-/************************************/
-
-// Set is used to store a new key/value pair exclusively for this context.
-// It also lazy initializes  c.Keys if it was not used previously.
-func (c *storage) Set(key string, value any) {
-	c.mu.Lock()
-	if c.Keys == nil {
-		c.Keys = make(map[string]any)
-	}
-
-	c.Keys[key] = value
-	c.mu.Unlock()
+// LaterSendMessage 延后发送指定类型的数据帧。
+func (ctx *Context) LaterSendMessage(messageType int, payload []byte) error {
+	return ctx.client.LaterSendMessage(messageType, payload)
 }
 
-// Get returns the value for the given key, ie: (value, true).
-// If the value does not exists it returns (nil, false)
-func (c *storage) Get(key string) (value any, exists bool) {
-	c.mu.RLock()
-	value, exists = c.Keys[key]
-	c.mu.RUnlock()
-	return
+// Shutdown 把已经排队的消息发完再关闭。
+func (ctx *Context) Shutdown() error {
+	return ctx.client.Shutdown()
 }
 
-// GetString returns the value associated with the key as a string.
-func (c *storage) GetString(key string) (s string) {
-	if val, ok := c.Get(key); ok && val != nil {
-		s, _ = val.(string)
-	}
-	return
+type wsMsg struct {
+	typ  int
+	data []byte
 }
 
-// GetBool returns the value associated with the key as a boolean.
-func (c *storage) GetBool(key string) (b bool) {
-	if val, ok := c.Get(key); ok && val != nil {
-		b, _ = val.(bool)
-	}
-	return
-}
-
-// GetInt returns the value associated with the key as an integer.
-func (c *storage) GetInt(key string) (i int) {
-	if val, ok := c.Get(key); ok && val != nil {
-		i, _ = val.(int)
-	}
-	return
-}
-
-// GetInt64 returns the value associated with the key as an integer.
-func (c *storage) GetInt64(key string) (i64 int64) {
-	if val, ok := c.Get(key); ok && val != nil {
-		i64, _ = val.(int64)
-	}
-	return
-}
-
-// GetUint returns the value associated with the key as an unsigned integer.
-func (c *storage) GetUint(key string) (ui uint) {
-	if val, ok := c.Get(key); ok && val != nil {
-		ui, _ = val.(uint)
-	}
-	return
-}
-
-// GetUint64 returns the value associated with the key as an unsigned integer.
-func (c *storage) GetUint64(key string) (ui64 uint64) {
-	if val, ok := c.Get(key); ok && val != nil {
-		ui64, _ = val.(uint64)
-	}
-	return
-}
-
-// GetFloat64 returns the value associated with the key as a float64.
-func (c *storage) GetFloat64(key string) (f64 float64) {
-	if val, ok := c.Get(key); ok && val != nil {
-		f64, _ = val.(float64)
-	}
-	return
-}
-
-// GetTime returns the value associated with the key as time.
-func (c *storage) GetTime(key string) (t time.Time) {
-	if val, ok := c.Get(key); ok && val != nil {
-		t, _ = val.(time.Time)
-	}
-	return
-}
-
-// GetDuration returns the value associated with the key as a duration.
-func (c *storage) GetDuration(key string) (d time.Duration) {
-	if val, ok := c.Get(key); ok && val != nil {
-		d, _ = val.(time.Duration)
-	}
-	return
-}
-
-// GetStringSlice returns the value associated with the key as a slice of strings.
-func (c *storage) GetStringSlice(key string) (ss []string) {
-	if val, ok := c.Get(key); ok && val != nil {
-		ss, _ = val.([]string)
-	}
-	return
-}
-
-// GetStringMap returns the value associated with the key as a map of interfaces.
-func (c *storage) GetStringMap(key string) (sm map[string]any) {
-	if val, ok := c.Get(key); ok && val != nil {
-		sm, _ = val.(map[string]interface{})
-	}
-	return
-}
-
-// GetStringMapString returns the value associated with the key as a map of strings.
-func (c *storage) GetStringMapString(key string) (sms map[string]string) {
-	if val, ok := c.Get(key); ok && val != nil {
-		sms, _ = val.(map[string]string)
-	}
-	return
-}
-
-// GetStringMapStringSlice returns the value associated with the key as a map to a slice of strings.
-func (c *storage) GetStringMapStringSlice(key string) (smss map[string][]string) {
-	if val, ok := c.Get(key); ok && val != nil {
-		smss, _ = val.(map[string][]string)
-	}
-	return
-}
-
-type client struct {
-	isClose bool               //是否已关闭
-	ctx     Context            //协程控制
-	cancel  context.CancelFunc //协程控制
-
+// Client 是一条 WebSocket 连接，可以作为客户端或服务端。
+type Client struct {
 	options *Options
+	ctx     Context
 
-	lock sync.Mutex //锁
+	conn   *websocket.Conn
+	cancel context.CancelFunc
+	base   context.Context
 
+	mu        sync.Mutex
+	cbMu      sync.Mutex
+	state     int
+	closeOnce sync.Once
+	wg        sync.WaitGroup
+
+	send  chan wsMsg
+	later chan wsMsg
+
+	readLimit    int64
+	readWait     time.Duration
+	pingInterval time.Duration
+	writeTimeout time.Duration
+
+	cond      *sync.Cond
+	sending   int
+	graceful  chan struct{}
+	drainDone chan struct{}
+	drainErr  error
 }
 
 type onOpen func(*Context)
-
 type onClose func(*Context)
-
 type onMessage func(*Context, []byte)
-
 type onError func(*Context, error)
 
-var closeErrorCode = []int{
-	websocket.CloseNormalClosure,
-	websocket.CloseGoingAway,
-	websocket.CloseProtocolError,
-	websocket.CloseUnsupportedData,
-	websocket.CloseNoStatusReceived,
-	websocket.CloseAbnormalClosure,
-	websocket.CloseInvalidFramePayloadData,
-	websocket.ClosePolicyViolation,
-	websocket.CloseMessageTooBig,
-	websocket.CloseMandatoryExtension,
-	websocket.CloseInternalServerErr,
-	websocket.CloseServiceRestart,
-	websocket.CloseTryAgainLater,
-	websocket.CloseTLSHandshake,
+// NewWebsocket 创建一条尚未连接的 Client。
+func NewWebsocket(opts ...Option) *Client {
+	cf := &Options{}
+	for _, fn := range opts {
+		if fn != nil {
+			fn(cf)
+		}
+	}
+	c := &Client{
+		options:      cf,
+		readLimit:    defaultReadLimit,
+		pingInterval: cf.pingInterval,
+		writeTimeout: defaultWriteTimeout,
+	}
+	c.cond = sync.NewCond(&c.mu)
+	c.ctx.client = c
+	c.ctx.Ctx = context.Background()
+	if cf.readLimitSet {
+		c.readLimit = cf.readLimit
+	}
+	if cf.writeTimeoutSet && cf.writeTimeout > 0 {
+		c.writeTimeout = cf.writeTimeout
+	}
+	return c
 }
 
-// 实际执行开始的函数
-func (c *client) init() error {
-	c.ctx.Ctx, c.cancel = context.WithCancel(c.ctx.Ctx)
-	c.ctx.sendChan = make(chan []byte, 100)
-	c.ctx.secondSendChan = make(chan []byte, 100)
-	c.isClose = false
-	go c.writeWs()
-	if c.options.onMessage != nil {
-		go c.readWs()
+func (o *Options) validate() error {
+	switch o.serviceType {
+	case CLIENT:
+		if o.wsHost == nil || o.wsHost.Host == "" {
+			return errors.New("gws: 客户端地址为空")
+		}
+	case SERVER:
+		if o.httpWrite == nil || o.httpRequest == nil {
+			return errors.New("gws: 服务端 http 参数为空")
+		}
+	default:
+		return errors.New("gws: 未配置客户端地址或服务端 http")
 	}
-	c.openFn()
 	return nil
 }
 
-// 实际执行结束的函数
-func (c *client) close() {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	if c.isClose || c.ctx.conn == nil {
-		c.isClose = true
+// Connect 建立连接并启动读写循环。失败后可以再次调用；成功或主动关闭后不能重复连接。
+func (c *Client) Connect() error {
+	c.mu.Lock()
+	switch c.state {
+	case stateRunning:
+		c.mu.Unlock()
+		return ErrAlreadyConnected
+	case stateIdle:
+	default:
+		c.mu.Unlock()
+		return ErrClosed
+	}
+	if err := c.options.validate(); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	base, cancel := context.WithCancel(context.Background())
+	c.base = base
+	c.cancel = cancel
+	c.ctx.Ctx = base
+	c.state = stateDialing
+	c.mu.Unlock()
+
+	conn, err := c.open(base)
+
+	c.mu.Lock()
+	if err != nil {
+		if c.state == stateDialing {
+			c.state = stateIdle
+			c.base = nil
+			c.cancel = nil
+			c.ctx.Ctx = context.Background()
+			c.mu.Unlock()
+			cancel()
+			return err
+		}
+		c.mu.Unlock()
+		return err
+	}
+	if c.state != stateDialing {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return ErrClosed
+	}
+
+	c.conn = conn
+	c.send = make(chan wsMsg, sendQueueSize)
+	c.later = make(chan wsMsg, sendQueueSize)
+	c.graceful = make(chan struct{}, 1)
+	if c.pingInterval > 0 {
+		c.readWait = c.pingInterval * 2
+	} else {
+		c.readWait = 0
+	}
+	c.prepareConn()
+	c.state = stateRunning
+	onOpen := c.options.onOpen
+	c.wg.Add(2)
+	go c.readLoop()
+	go c.writeLoop()
+	go c.waitClose()
+	c.mu.Unlock()
+
+	if onOpen != nil {
+		if callErr := c.callUser(func() { onOpen(&c.ctx) }); callErr != nil {
+			c.Close()
+			return fmt.Errorf("gws: 连接回调异常: %v", callErr)
+		}
+	}
+	return nil
+}
+
+func (c *Client) open(ctx context.Context) (*websocket.Conn, error) {
+	if c.options.serviceType == CLIENT {
+		conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.options.wsHost.String(), c.options.requestHeader)
+		return conn, err
+	}
+	upgrader := websocket.Upgrader{}
+	if c.options.checkOrigin != nil {
+		upgrader.CheckOrigin = func(r *http.Request) bool {
+			return c.options.checkOrigin(r, &c.ctx)
+		}
+	}
+	return upgrader.Upgrade(c.options.httpWrite, c.options.httpRequest, nil)
+}
+
+func (c *Client) prepareConn() {
+	if c.readLimit > 0 {
+		c.conn.SetReadLimit(c.readLimit)
+	}
+	if c.readWait <= 0 {
 		return
 	}
-	c.isClose = true
-	c.cancel()
-	c.closeFn()
-
+	_ = c.conn.SetReadDeadline(time.Now().Add(c.readWait))
+	wait := c.readWait
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(wait))
+	})
 }
 
-// 发送协程
-func (c *client) writeWs() {
+// Close 立即关闭连接，队列里还没写出的消息直接丢掉。
+// 重复调用和在回调里调用都是安全的。连接建立前调用不会产生效果。
+func (c *Client) Close() {
+	c.finish(true)
+}
+
+// Shutdown 先拒绝新的发送，把两个队列里已经收下的消息写完，再关闭连接。
+// 写剩余消息时网络断开，返回该错误，并同样通知 OnError。
+// 不要在 OnMessage、OnError、OnClose 里同步调用，需要时用 go c.Shutdown()。
+func (c *Client) Shutdown() error {
+	c.mu.Lock()
+	switch c.state {
+	case stateIdle:
+		c.mu.Unlock()
+		return ErrNotConnected
+	case stateDialing:
+		cancel := c.cancel
+		c.state = stateClosed
+		c.mu.Unlock()
+		c.stop(nil, cancel)
+		return ErrClosed
+	case stateClosed:
+		err := c.drainErr
+		c.mu.Unlock()
+		return err
+	case stateDraining:
+		ch := c.drainDone
+		c.mu.Unlock()
+		<-ch
+		return c.drainResult()
+	default:
+		c.state = stateDraining
+		ch := make(chan struct{})
+		c.drainDone = ch
+		c.drainErr = nil
+		c.mu.Unlock()
+		select {
+		case c.graceful <- struct{}{}:
+		default:
+		}
+		<-ch
+		return c.drainResult()
+	}
+}
+
+func (c *Client) drainResult() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.drainErr
+}
+
+func (c *Client) noteDrainErr(err error) {
+	if err == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.drainDone != nil && c.drainErr == nil {
+		c.drainErr = err
+	}
+	c.mu.Unlock()
+}
+
+// finish 关闭底层连接。abandon 为 true 时，正在排空的队列不再继续写。
+func (c *Client) finish(abandon bool) {
+	c.mu.Lock()
+	switch c.state {
+	case stateIdle:
+		c.mu.Unlock()
+	case stateDialing:
+		cancel := c.cancel
+		c.state = stateClosed
+		c.cond.Broadcast()
+		c.mu.Unlock()
+		c.stop(nil, cancel)
+	case stateRunning, stateDraining:
+		if abandon && c.drainDone != nil && c.drainErr == nil {
+			c.drainErr = ErrClosed
+		}
+		conn := c.conn
+		cancel := c.cancel
+		c.state = stateClosed
+		c.cond.Broadcast()
+		c.mu.Unlock()
+		c.stop(conn, cancel)
+	default:
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	}
+}
+
+func (c *Client) stop(conn *websocket.Conn, cancel context.CancelFunc) {
+	c.closeOnce.Do(func() {
+		if cancel != nil {
+			cancel()
+		}
+		if conn == nil {
+			return
+		}
+		wait := c.closeWait()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_ = conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+				time.Now().Add(wait),
+			)
+		}()
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+		}
+		_ = conn.Close()
+	})
+}
+
+func (c *Client) closeWait() time.Duration {
+	if c.writeTimeout > 0 && c.writeTimeout < maxCloseWait {
+		return c.writeTimeout
+	}
+	return maxCloseWait
+}
+
+func (c *Client) waitClose() {
+	c.wg.Wait()
+	c.mu.Lock()
+	fn := c.options.onClose
+	c.mu.Unlock()
+	if fn == nil {
+		return
+	}
+	_ = c.callUser(func() { fn(&c.ctx) })
+}
+
+func (c *Client) loopExit() {
+	c.finish(false)
+	c.wg.Done()
+}
+
+// ForthwithSend 立即发送文本消息。
+func (c *Client) ForthwithSend(payload []byte) error {
+	return c.enqueue(false, websocket.TextMessage, payload)
+}
+
+// LaterSend 在当前已排队的立即消息之后发送文本消息。
+func (c *Client) LaterSend(payload []byte) error {
+	return c.enqueue(true, websocket.TextMessage, payload)
+}
+
+// ForthwithSendMessage 立即发送文本或二进制帧。
+func (c *Client) ForthwithSendMessage(messageType int, payload []byte) error {
+	return c.enqueue(false, messageType, payload)
+}
+
+// LaterSendMessage 延后发送文本或二进制帧。
+func (c *Client) LaterSendMessage(messageType int, payload []byte) error {
+	return c.enqueue(true, messageType, payload)
+}
+
+func (c *Client) enqueue(later bool, messageType int, payload []byte) error {
+	if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
+		return fmt.Errorf("gws: 不支持的消息类型 %d", messageType)
+	}
+	c.mu.Lock()
+	if c.state != stateRunning {
+		state := c.state
+		c.mu.Unlock()
+		if state == stateClosed || state == stateDraining {
+			return ErrClosed
+		}
+		return ErrNotConnected
+	}
+	c.sending++
+	ch := c.send
+	if later {
+		ch = c.later
+	}
+	done := c.base.Done()
+	c.mu.Unlock()
 	defer func() {
-		if err := recover(); err != nil {
-			c.errorFn(fmt.Errorf("发送协程出现异常: %v", err))
+		c.mu.Lock()
+		c.sending--
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	}()
+
+	msg := wsMsg{typ: messageType, data: cloneBytes(payload)}
+	select {
+	case <-done:
+		return ErrClosed
+	case ch <- msg:
+		return nil
+	}
+}
+
+func cloneBytes(p []byte) []byte {
+	if len(p) == 0 {
+		return nil
+	}
+	b := make([]byte, len(p))
+	copy(b, p)
+	return b
+}
+
+// OnOpen 设置连接成功回调，应在 Connect 之前调用。
+func (c *Client) OnOpen(fn onOpen) {
+	c.mu.Lock()
+	c.options.onOpen = fn
+	c.mu.Unlock()
+}
+
+// OnClose 设置连接结束回调。回调返回后不会再有读写。
+func (c *Client) OnClose(fn onClose) {
+	c.mu.Lock()
+	c.options.onClose = fn
+	c.mu.Unlock()
+}
+
+// OnError 设置错误回调。正常关闭不会触发。
+func (c *Client) OnError(fn onError) {
+	c.mu.Lock()
+	c.options.onError = fn
+	c.mu.Unlock()
+}
+
+// OnMessage 设置消息回调。不设置时仍会读取连接，以便处理关闭和心跳。
+func (c *Client) OnMessage(fn onMessage) {
+	c.mu.Lock()
+	c.options.onMessage = fn
+	c.mu.Unlock()
+}
+
+func (c *Client) readLoop() {
+	defer c.loopExit()
+	defer c.recoverAs("读取")
+	for {
+		if c.readWait > 0 {
+			_ = c.conn.SetReadDeadline(time.Now().Add(c.readWait))
+		}
+		mt, payload, err := c.conn.ReadMessage()
+		if err != nil {
+			report := c.shouldReport(err)
+			c.Close()
+			if report {
+				c.reportError(err)
+			}
+			return
+		}
+		c.mu.Lock()
+		fn := c.options.onMessage
+		c.mu.Unlock()
+		if fn == nil {
+			continue
+		}
+		go c.handleMessage(fn, mt, payload)
+	}
+}
+
+// handleMessage 在独立协程里执行业务回调。回调 panic 只通知 OnError，不关闭连接，读循环继续。
+func (c *Client) handleMessage(fn onMessage, mt int, payload []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.reportError(fmt.Errorf("gws: 消息回调异常: %v", r))
 		}
 	}()
+	c.cbMu.Lock()
+	defer c.cbMu.Unlock()
+	c.ctx.MessageType = mt
+	fn(&c.ctx, payload)
+}
+
+func (c *Client) writeLoop() {
+	defer c.wakeDrain()
+	defer c.loopExit()
+	defer c.recoverAs("发送")
+
+	var pingC <-chan time.Time
+	if c.pingInterval > 0 {
+		ticker := time.NewTicker(c.pingInterval)
+		defer ticker.Stop()
+		pingC = ticker.C
+	}
 	for {
 		select {
-		case data := <-c.ctx.sendChan:
-			c.write(data)
-		case secondData := <-c.ctx.secondSendChan:
-		priority:
-			for {
-				select {
-				case data := <-c.ctx.sendChan:
-					if len(data) == 0 {
-						break priority
-					}
-					c.write(data)
-				default:
-					break priority
-				}
+		case <-c.base.Done():
+			return
+		case <-c.graceful:
+			c.drainAll()
+			return
+		case msg := <-c.send:
+			if !c.writeOne(msg) {
+				return
 			}
-			c.write(secondData)
-		case <-c.ctx.Ctx.Done():
+		case msg := <-c.later:
+			if !c.writeLater(msg) {
+				return
+			}
+		case <-pingC:
+			if err := c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(c.writeTimeout)); err != nil {
+				c.fail(err)
+				return
+			}
 		}
-		if c.isClose {
-			break
-		}
 	}
-	_ = c.safeCloseChan(c.ctx.sendChan)
-	for data := range c.ctx.sendChan {
-		_ = c.ctx.conn.WriteMessage(websocket.TextMessage, data)
-	}
-	_ = c.safeCloseChan(c.ctx.secondSendChan)
-	for data := range c.ctx.secondSendChan {
-		_ = c.ctx.conn.WriteMessage(websocket.TextMessage, data)
-	}
-	_ = c.ctx.conn.Close()
 }
 
-// 接收消息
-func (c *client) readWs() {
-	defer func() {
-		if err := recover(); err != nil {
-			c.errorFn(fmt.Errorf("读取协程出现异常: %v", err))
-		}
-		if !c.isClose {
-			c.close()
-		}
-	}()
+// drainAll 写完调用 Shutdown 时已经排队的消息。写入失败或被 Close 打断时返回。
+func (c *Client) drainAll() {
 	for {
-		_, message, err := c.ctx.conn.ReadMessage()
-		if err != nil {
-			c.errorFn(err)
-			if _, ok := err.(*net.OpError); ok || websocket.IsCloseError(err, closeErrorCode...) || c.isClose {
+		msg, ok := c.popQueued()
+		if ok {
+			if !c.writeOne(msg) {
 				return
 			}
 			continue
 		}
-		c.options.onMessage(&c.ctx, message)
-	}
-}
-
-func (c *client) write(data []byte) {
-	err := c.ctx.conn.WriteMessage(websocket.TextMessage, data)
-	if err != nil {
-		c.errorFn(err)
-		if websocket.IsCloseError(err, closeErrorCode...) {
-			c.close()
+		c.mu.Lock()
+		for c.state == stateDraining && c.sending > 0 && len(c.send) == 0 && len(c.later) == 0 {
+			c.cond.Wait()
+		}
+		state := c.state
+		pending := len(c.send) > 0 || len(c.later) > 0 || c.sending > 0
+		c.mu.Unlock()
+		if state != stateDraining || !pending {
 			return
 		}
 	}
 }
 
-func (c *client) safeCloseChan(ch chan []byte) (justClosed bool) {
+func (c *Client) popQueued() (wsMsg, bool) {
+	select {
+	case msg := <-c.send:
+		return msg, true
+	default:
+	}
+	select {
+	case msg := <-c.send:
+		return msg, true
+	case msg := <-c.later:
+		return msg, true
+	default:
+		return wsMsg{}, false
+	}
+}
+
+func (c *Client) wakeDrain() {
+	c.mu.Lock()
+	ch := c.drainDone
+	c.drainDone = nil
+	c.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+func (c *Client) writeLater(msg wsMsg) bool {
+	// 只让出已经排在立即队列里的消息，避免新的立即消息把这条延后消息饿死。
+	for i := 0; i < sendQueueSize; i++ {
+		select {
+		case <-c.base.Done():
+			return false
+		case first := <-c.send:
+			if !c.writeOne(first) {
+				return false
+			}
+		default:
+			return c.writeOne(msg)
+		}
+	}
+	return c.writeOne(msg)
+}
+
+func (c *Client) writeOne(msg wsMsg) bool {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+		c.noteDrainErr(err)
+		c.fail(err)
+		return false
+	}
+	if err := c.conn.WriteMessage(msg.typ, msg.data); err != nil {
+		c.noteDrainErr(err)
+		c.fail(err)
+		return false
+	}
+	return true
+}
+
+func (c *Client) fail(err error) {
+	report := c.shouldReport(err)
+	c.Close()
+	if report {
+		c.reportError(err)
+	}
+}
+
+func (c *Client) recoverAs(name string) {
+	if r := recover(); r != nil {
+		c.Close()
+		c.reportError(fmt.Errorf("gws: %s协程异常: %v", name, r))
+	}
+}
+
+func (c *Client) shouldReport(err error) bool {
+	if err == nil || c.isClosed() || isBenignClose(err) {
+		return false
+	}
+	return true
+}
+
+func (c *Client) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state == stateClosed
+}
+
+func isBenignClose(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) || errors.Is(err, websocket.ErrCloseSent) {
+		return true
+	}
+	return websocket.IsCloseError(err,
+		websocket.CloseNormalClosure,
+		websocket.CloseGoingAway,
+	)
+}
+
+func (c *Client) reportError(err error) {
+	if err == nil {
+		return
+	}
+	c.mu.Lock()
+	fn := c.options.onError
+	c.mu.Unlock()
+	if fn == nil {
+		return
+	}
+	_ = c.callUser(func() { fn(&c.ctx, err) })
+}
+
+func (c *Client) callUser(fn func()) (err error) {
+	c.cbMu.Lock()
+	defer c.cbMu.Unlock()
 	defer func() {
-		if recover() != nil {
-			justClosed = false
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
 		}
 	}()
-	// assume ch != nil here.
-	close(ch)   // panic if ch is closed
-	return true // <=> justClosed = true; return
+	fn()
+	return nil
 }
-
-// 执行结束闭包函数
-func (c *client) errorFn(err error) {
-	if c.options.onError != nil {
-		c.options.onError(&c.ctx, err)
-	}
-}
-
-// 执行连接成功闭包函数
-func (c *client) openFn() {
-	if c.options.onOpen != nil {
-		c.options.onOpen(&c.ctx)
-	}
-}
-
-// //执行关闭闭包函数
-func (c *client) closeFn() {
-	if c.options.onClose != nil {
-		c.options.onClose(&c.ctx)
-	}
-}
-
-/*************************************************WS链接内部逻辑end***************************************************/
